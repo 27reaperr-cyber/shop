@@ -109,6 +109,11 @@ def init_db():
             referrer_id INTEGER NOT NULL,
             user_id     INTEGER NOT NULL UNIQUE
         );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     """)
     conn.commit()
 
@@ -191,9 +196,26 @@ def db_referral_stats(telegram_id: int):
         ).fetchone()[0]
         return count, earned
 
-# ─────────────────────────────────────────────
-#  KEYBOARDS
-# ─────────────────────────────────────────────
+def db_get_setting(key: str) -> str | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row['value'] if row else None
+
+def db_set_setting(key: str, value: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value)
+        )
+        conn.commit()
+
+def db_del_setting(key: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        conn.commit()
+
+
 def kb_main():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🛍 Купить"),      KeyboardButton(text="👤 Мой профиль")],
@@ -261,6 +283,7 @@ def kb_admin():
          InlineKeyboardButton(text="✦ Статистика",    callback_data="adm_stats")],
         [InlineKeyboardButton(text="♱ Заявки оплат",  callback_data="adm_payments")],
         [InlineKeyboardButton(text="⇢ Рассылка",      callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="☁︎ GIF при старте", callback_data="adm_start_gif")],
     ])
 
 def kb_admin_products():
@@ -340,6 +363,7 @@ class AdminStates(StatesGroup):
     edit_prod_desc       = State()
     edit_prod_price      = State()
     broadcast_text       = State()
+    set_start_gif        = State()   # ожидание GIF для стартового сообщения
 
 # ─────────────────────────────────────────────
 #  CRYPTO BOT API
@@ -480,13 +504,23 @@ async def cmd_start(msg: Message):
     if ref_db_id:
         db_add_referral(ref_db_id, user['id'])
 
-    await msg.answer(
+    text = (
         f"☁︎ Добро пожаловать, <b>{msg.from_user.first_name}</b> :D\n\n"
         f"❝dreinn.shop❞\n\n"
-        f"◦ используй меню ниже",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_main()
+        f"◦ используй меню ниже"
     )
+
+    gif_file_id = db_get_setting("start_gif")
+    if gif_file_id:
+        # Отправляем GIF + текст как caption
+        await msg.answer_animation(
+            animation=gif_file_id,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_main()
+        )
+    else:
+        await msg.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
 
 # ── Главное меню ──────────────────────────────
 @router.message(F.text == "ℹ️ О шопе")
@@ -1547,6 +1581,97 @@ async def adm_del_product(call: CallbackQuery):
             [InlineKeyboardButton(text="← Назад", callback_data="adm_products")]
         ])
     )
+
+# ── GIF стартового сообщения ──────────────────
+@router.callback_query(F.data == "adm_start_gif")
+async def adm_start_gif_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    gif_set = db_get_setting("start_gif")
+    status  = "◦ сейчас: <b>установлен</b> ✔" if gif_set else "◦ сейчас: <b>не задан</b>"
+    rows = [
+        [InlineKeyboardButton(text="☁︎ Загрузить / заменить GIF", callback_data="adm_gif_upload")],
+    ]
+    if gif_set:
+        rows.append([InlineKeyboardButton(text="✕ Удалить GIF", callback_data="adm_gif_delete")])
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data="admin_back")])
+    await call.message.edit_text(
+        f"☁︎ <b>GIF стартового сообщения</b>\n\n"
+        f"{status}\n\n"
+        f"◦ GIF будет отправляться вместе с приветствием при /start\n"
+        f"◦ поддерживаются GIF-файлы и анимированные стикеры",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+@router.callback_query(F.data == "adm_gif_upload")
+async def adm_gif_upload(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminStates.set_start_gif)
+    await call.message.edit_text(
+        "☁︎ <b>Загрузка GIF</b>\n\n"
+        "◦ пришли GIF-файл или анимацию прямо в этот чат\n"
+        "◦ лучше всего работают короткие GIF (1–3 сек)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Отмена", callback_data="adm_start_gif")]
+        ])
+    )
+
+@router.message(AdminStates.set_start_gif, F.animation | F.document)
+async def adm_gif_receive(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+
+    # Получаем file_id — animation (GIF) или document
+    if msg.animation:
+        file_id   = msg.animation.file_id
+        file_type = "animation"
+    else:
+        # Документ — принимаем, но предупреждаем если не GIF
+        file_id   = msg.document.file_id
+        file_type = "document"
+        mime = msg.document.mime_type or ""
+        if "gif" not in mime and "video" not in mime:
+            await msg.answer(
+                "◦ файл принят, но убедись что это GIF/анимация — "
+                "иначе он может не воспроизводиться корректно"
+            )
+
+    db_set_setting("start_gif", file_id)
+    await state.clear()
+
+    # Показываем превью
+    await msg.answer_animation(
+        animation=file_id,
+        caption="✔ <b>GIF установлен!</b>\n◦ теперь он будет показываться при /start",
+        parse_mode=ParseMode.HTML
+    )
+
+@router.message(AdminStates.set_start_gif)
+async def adm_gif_wrong_type(msg: Message):
+    """Прислали не анимацию"""
+    await msg.answer(
+        "◦ нужен <b>GIF-файл</b> или анимация\n"
+        "☛ просто перешли или прикрепи GIF",
+        parse_mode=ParseMode.HTML
+    )
+
+@router.callback_query(F.data == "adm_gif_delete")
+async def adm_gif_delete(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.clear()
+    db_del_setting("start_gif")
+    await call.message.edit_text(
+        "✕ <b>GIF удалён</b>\n\n◦ стартовое сообщение теперь без анимации",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Назад", callback_data="adm_start_gif")]
+        ])
+    )
+    await call.answer()
 
 # ── Рассылка ──────────────────────────────────
 @router.callback_query(F.data == "adm_broadcast")
