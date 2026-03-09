@@ -239,6 +239,15 @@ def db_del_setting(key: str):
         conn.execute("DELETE FROM settings WHERE key=?", (key,))
         conn.commit()
 
+def db_already_purchased(user_db_id: int, product_id: int) -> bool:
+    """True если пользователь уже покупал этот товар/услугу."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM purchases WHERE user_id=? AND product_id=? LIMIT 1",
+            (user_db_id, product_id)
+        ).fetchone()
+    return row is not None
+
 def db_has_active_service(user_db_id: int) -> bool:
     """Проверяет, есть ли у пользователя активная/ожидающая услуга."""
     with get_db() as conn:
@@ -492,37 +501,42 @@ class AdminStates(StatesGroup):
 CRYPTOBOT_API = "https://pay.crypt.bot/api"
 
 async def get_usdt_rate() -> float:
-    # 1. Binance — публичный API
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                "https://api.binance.com/api/v3/ticker/price",
-                params={"symbol": "USDTRUB"},
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    rate = float(data["price"])
-                    if rate > 1:
-                        return rate
-    except Exception as e:
-        log.warning(f"Binance rate error: {e}")
-    # 2. CryptoBot
+    """
+    Получаем курс USDT → RUB через CryptoBot API.
+    CryptoBot возвращает пары вида {source, target, rate} где
+    rate = сколько target за 1 source.
+    Нам нужна пара USDT/RUB (сколько рублей за 1 USDT).
+    Фолбэк: 90.0.
+    """
     if CRYPTOBOT_TOKEN:
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(
                     f"{CRYPTOBOT_API}/getExchangeRates",
                     headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=8)
                 ) as r:
                     data = await r.json()
-                    for item in data.get("result", []):
-                        src, tgt = item.get("source", ""), item.get("target", "")
-                        if src == "USDT" and tgt == "RUB":
-                            return float(item["rate"])
-                        if src == "RUB" and tgt == "USDT" and float(item["rate"]) > 0:
-                            return 1.0 / float(item["rate"])
+                    items = data.get("result", [])
+                    for item in items:
+                        src = item.get("source", "").upper()
+                        tgt = item.get("target", "").upper()
+                        raw = item.get("rate", "0")
+                        rate = float(raw)
+                        # Прямая пара: USDT → RUB
+                        if src == "USDT" and tgt == "RUB" and rate > 1:
+                            log.info(f"USDT rate from CryptoBot (USDT→RUB): {rate}")
+                            return rate
+                    # Обратная пара: RUB → USDT (1 RUB = X USDT → 1 USDT = 1/X RUB)
+                    for item in items:
+                        src = item.get("source", "").upper()
+                        tgt = item.get("target", "").upper()
+                        raw = item.get("rate", "0")
+                        rate = float(raw)
+                        if src == "RUB" and tgt == "USDT" and rate > 0:
+                            inverted = round(1.0 / rate, 4)
+                            log.info(f"USDT rate from CryptoBot (RUB→USDT inverted): {inverted}")
+                            return inverted
         except Exception as e:
             log.warning(f"CryptoBot rate error: {e}")
     log.warning("Using hardcoded USDT rate: 90.0")
@@ -1064,19 +1078,34 @@ async def show_category(call: CallbackQuery):
 @router.callback_query(F.data.startswith("product:"))
 async def show_product(call: CallbackQuery):
     product_id = int(call.data.split(":")[1])
+    user = db_get_user(call.from_user.id)
     with get_db() as conn:
         p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
     ptype = p['type'] or 'product'
     type_badge = "♱ Услуга" if ptype == 'service' else "◦ Товар"
+    already = db_already_purchased(user['id'], product_id) if user else False
+    if already:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✔ Уже куплено", callback_data="noop")],
+            [InlineKeyboardButton(text="← Назад", callback_data=f"cat:{p['category_id']}")],
+        ])
+    else:
+        kb = kb_buy_product(product_id, p['category_id'], ptype)
+    badge_note = "\n◦ <i>вы уже приобрели этот товар</i>" if already else ""
     await call.message.edit_text(
         f"{'♱' if ptype=='service' else '◈'} <b>{p['name']}</b>\n"
         f"{'─'*22}\n"
         f"{p['description']}\n\n"
         f"◦ Тип: {type_badge}\n"
-        f"✯ Цена: <b>{p['price']:.2f}₽</b>",
+        f"✯ Цена: <b>{p['price']:.2f}₽</b>{badge_note}",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_buy_product(product_id, p['category_id'], ptype)
+        reply_markup=kb
     )
+
+# ── Заглушка для неактивных кнопок ───────────
+@router.callback_query(F.data == "noop")
+async def noop(call: CallbackQuery):
+    await call.answer()
 
 # ── Покупка ───────────────────────────────────
 @router.callback_query(F.data.startswith("buy:"))
@@ -1089,6 +1118,10 @@ async def buy_product(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     user  = db_get_user(call.from_user.id)
     ptype = p['type'] or 'product'
+
+    # Проверка: уже куплено
+    if db_already_purchased(user['id'], product_id):
+        await call.answer("◦ вы уже приобрели этот товар", show_alert=True); return
 
     # Блокировка при активной услуге
     if db_has_active_service(user['id']):
