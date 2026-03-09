@@ -50,6 +50,7 @@ log = logging.getLogger(__name__)
 def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # better concurrent read/write
     return conn
 
 def init_db():
@@ -216,8 +217,8 @@ def kb_topup():
 
 def kb_bank_paid(payment_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✔ Я оплатил",  callback_data=f"bank_paid:{payment_id}")],
-        [InlineKeyboardButton(text="← Отмена",     callback_data="topup")],
+        [InlineKeyboardButton(text="✔ Я оплатил — прислать чек",  callback_data=f"bank_paid:{payment_id}")],
+        [InlineKeyboardButton(text="← Отмена",                    callback_data="topup")],
     ])
 
 def kb_crypto(invoice_url: str, payment_id: int):
@@ -317,6 +318,7 @@ def kb_confirm_payment(payment_id: int, user_db_id: int):
 # ─────────────────────────────────────────────
 class TopupStates(StatesGroup):
     amount_bank   = State()
+    bank_receipt  = State()   # ожидание скриншота/чека
     amount_crypto = State()
 
 class TransferStates(StatesGroup):
@@ -345,21 +347,54 @@ class AdminStates(StatesGroup):
 CRYPTOBOT_API = "https://pay.crypt.bot/api"
 
 async def get_usdt_rate() -> float:
-    if not CRYPTOBOT_TOKEN:
-        return 90.0
+    """
+    Получаем курс USDT/RUB.
+    Приоритет: Binance P2P (публичный) → CryptoBot API → хардкод.
+    """
+    # 1. Binance — публичный API, не требует токена
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
-                f"{CRYPTOBOT_API}/getExchangeRates",
-                headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": "USDTRUB"},
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as r:
-                data = await r.json()
-                for item in data.get("result", []):
-                    if item.get("source") == "RUB" and item.get("target") == "USDT":
-                        return float(item["rate"])
+                if r.status == 200:
+                    data = await r.json()
+                    rate = float(data["price"])
+                    if rate > 1:
+                        log.info(f"USDT rate from Binance: {rate}")
+                        return rate
     except Exception as e:
-        log.warning(f"Rate fetch error: {e}")
+        log.warning(f"Binance rate error: {e}")
+
+    # 2. CryptoBot — если задан токен
+    if CRYPTOBOT_TOKEN:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{CRYPTOBOT_API}/getExchangeRates",
+                    headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    data = await r.json()
+                    for item in data.get("result", []):
+                        src = item.get("source", "")
+                        tgt = item.get("target", "")
+                        # CryptoBot возвращает USDT→RUB, нам нужен rate как RUB за 1 USDT
+                        if src == "USDT" and tgt == "RUB":
+                            rate = float(item["rate"])
+                            log.info(f"USDT rate from CryptoBot: {rate}")
+                            return rate
+                        if src == "RUB" and tgt == "USDT" and float(item["rate"]) > 0:
+                            rate = 1.0 / float(item["rate"])
+                            log.info(f"USDT rate from CryptoBot (inverted): {rate}")
+                            return rate
+        except Exception as e:
+            log.warning(f"CryptoBot rate error: {e}")
+
+    # 3. Хардкод-фолбэк
+    log.warning("Using hardcoded USDT rate: 90.0")
     return 90.0
 
 async def create_crypto_invoice(amount_rub: float) -> dict | None:
@@ -499,7 +534,8 @@ async def show_profile(msg: Message):
     )
 
 @router.callback_query(F.data == "profile_back")
-async def profile_back(call: CallbackQuery):
+async def profile_back(call: CallbackQuery, state: FSMContext):
+    await state.clear()   # сброс любого активного состояния
     await call.message.edit_text(
         await _profile_text(call.from_user.id),
         parse_mode=ParseMode.HTML,
@@ -508,7 +544,8 @@ async def profile_back(call: CallbackQuery):
 
 # ── Пополнение ────────────────────────────────
 @router.callback_query(F.data == "topup")
-async def topup_menu(call: CallbackQuery):
+async def topup_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()   # сброс состояния если пришли через «Отмена»
     await call.message.edit_text(
         "✦ <b>Пополнение баланса</b>\n\n"
         "◦ выбери способ оплаты",
@@ -522,7 +559,7 @@ async def topup_bank_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(TopupStates.amount_bank)
     await call.message.edit_text(
         "♱ <b>Оплата по реквизитам</b>\n\n"
-        "◦ введи сумму пополнения (минимум 100₽)",
+        "◦ введи сумму пополнения (минимум 10₽)",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="← Отмена", callback_data="topup")]
@@ -533,14 +570,13 @@ async def topup_bank_start(call: CallbackQuery, state: FSMContext):
 async def topup_bank_amount(msg: Message, state: FSMContext):
     try:
         amount = float(msg.text.replace(",", ".").replace(" ", ""))
-        if amount < 100:
-            await msg.answer("◦ минимальная сумма — 100₽")
+        if amount < 10:
+            await msg.answer("◦ минимальная сумма — 10₽")
             return
     except ValueError:
         await msg.answer("◦ введи корректную сумму")
         return
 
-    await state.clear()
     user = db_get_user(msg.from_user.id)
     now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -552,6 +588,10 @@ async def topup_bank_amount(msg: Message, state: FSMContext):
         conn.commit()
         payment_id = cur.lastrowid
 
+    # Сохраняем payment_id в стейт для следующего шага
+    await state.update_data(bank_payment_id=payment_id)
+    await state.set_state(TopupStates.bank_receipt)
+
     await msg.answer(
         f"♱ <b>Реквизиты для оплаты</b>\n"
         f"{'─' * 22}\n"
@@ -559,41 +599,111 @@ async def topup_bank_amount(msg: Message, state: FSMContext):
         f"◦ Реквизиты: <code>{BANK_CARD}</code>\n"
         f"◦ Получатель: <b>{BANK_RECEIVER}</b>\n"
         f"◦ Сумма: <b>{amount:.2f}₽</b>\n\n"
-        f"☛ переведи точную сумму, затем нажми кнопку",
+        f"☛ переведи точную сумму, затем нажми кнопку ниже",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_bank_paid(payment_id)
     )
 
 @router.callback_query(F.data.startswith("bank_paid:"))
-async def bank_paid(call: CallbackQuery, bot: Bot):
+async def bank_paid(call: CallbackQuery, state: FSMContext, bot: Bot):
     payment_id = int(call.data.split(":")[1])
     with get_db() as conn:
         pay = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
-    if not pay or pay['status'] != 'pending':
-        await call.answer("заявка уже обработана", show_alert=True)
+
+    if not pay or pay['status'] not in ('pending',):
+        await call.answer("◦ заявка уже отправлена или обработана", show_alert=True)
         return
 
-    user = db_get_user(call.from_user.id)
+    # Сохраняем payment_id в FSM и переходим к ожиданию чека
+    await state.update_data(bank_payment_id=payment_id)
+    await state.set_state(TopupStates.bank_receipt)
+
     await call.message.edit_text(
-        "✔ <b>Заявка отправлена</b>\n\n"
+        "♱ <b>Подтверждение оплаты</b>\n\n"
+        "◦ пришли скриншот или фото чека оплаты\n"
+        "◦ поддерживаются фото и документы (PDF, JPG и др.)\n\n"
+        "☛ просто отправь файл в этот чат",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Отмена", callback_data="topup")]
+        ])
+    )
+    await call.answer()
+
+@router.message(TopupStates.bank_receipt, F.photo | F.document)
+async def topup_bank_receipt(msg: Message, state: FSMContext, bot: Bot):
+    data       = await state.get_data()
+    payment_id = data.get("bank_payment_id")
+
+    if not payment_id:
+        await state.clear()
+        await msg.answer("◦ что-то пошло не так, начни заново")
+        return
+
+    with get_db() as conn:
+        pay = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+
+    if not pay or pay['status'] != 'pending':
+        await state.clear()
+        await msg.answer("◦ заявка уже была отправлена ранее")
+        return
+
+    # Атомарно помечаем как sent — защита от двойной отправки
+    with get_db() as conn:
+        updated = conn.execute(
+            "UPDATE payments SET status='sent' WHERE id=? AND status='pending'",
+            (payment_id,)
+        ).rowcount
+        conn.commit()
+
+    if not updated:
+        await state.clear()
+        await msg.answer("◦ заявка уже была отправлена ранее")
+        return
+
+    await state.clear()
+
+    user = db_get_user(msg.from_user.id)
+
+    # Подтверждение пользователю
+    await msg.answer(
+        "✔ <b>Чек получен, заявка отправлена</b>\n\n"
         "◦ проверим платёж и зачислим средства в течение нескольких минут",
         parse_mode=ParseMode.HTML
     )
+
+    # Пересылаем чек администратору
+    caption = (
+        f"✦ <b>Новая заявка на пополнение</b>\n"
+        f"{'─' * 22}\n"
+        f"☛ <a href='tg://user?id={msg.from_user.id}'>{msg.from_user.full_name}</a>\n"
+        f"◦ ID: <code>{msg.from_user.id}</code>\n"
+        f"◦ Сумма: <b>{pay['amount']:.2f}₽</b>\n"
+        f"◦ Метод: реквизиты\n"
+        f"◦ Чек: ниже ↓"
+    )
     try:
         await bot.send_message(
-            ADMIN_ID,
-            f"✦ <b>Новая заявка на пополнение</b>\n"
-            f"{'─' * 22}\n"
-            f"☛ <a href='tg://user?id={call.from_user.id}'>{call.from_user.full_name}</a>\n"
-            f"◦ ID: <code>{call.from_user.id}</code>\n"
-            f"◦ Сумма: <b>{pay['amount']:.2f}₽</b>\n"
-            f"◦ Метод: реквизиты",
+            ADMIN_ID, caption,
             parse_mode=ParseMode.HTML,
             reply_markup=kb_confirm_payment(payment_id, user['id'])
         )
+        # Пересылаем сам файл
+        if msg.photo:
+            await bot.send_photo(ADMIN_ID, msg.photo[-1].file_id)
+        elif msg.document:
+            await bot.send_document(ADMIN_ID, msg.document.file_id)
     except Exception as e:
         log.error(f"Cannot notify admin: {e}")
-    await call.answer()
+
+@router.message(TopupStates.bank_receipt)
+async def topup_bank_receipt_wrong(msg: Message):
+    """Пользователь прислал не фото и не документ"""
+    await msg.answer(
+        "◦ нужно прислать <b>фото</b> или <b>документ</b> (скриншот/чек)\n"
+        "☛ просто отправь файл в этот чат",
+        parse_mode=ParseMode.HTML
+    )
 
 # — Crypto —
 @router.callback_query(F.data == "topup_crypto")
@@ -612,8 +722,8 @@ async def topup_crypto_start(call: CallbackQuery, state: FSMContext):
 async def topup_crypto_amount(msg: Message, state: FSMContext):
     try:
         amount = float(msg.text.replace(",", ".").replace(" ", ""))
-        if amount < 100:
-            await msg.answer("◦ минимальная сумма — 100₽")
+        if amount < 10:
+            await msg.answer("◦ минимальная сумма — 10₽")
             return
     except ValueError:
         await msg.answer("◦ введи корректную сумму")
@@ -826,7 +936,8 @@ async def show_catalog(msg: Message):
     )
 
 @router.callback_query(F.data == "catalog")
-async def catalog_back(call: CallbackQuery):
+async def catalog_back(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     with get_db() as conn:
         cats = conn.execute("SELECT * FROM categories").fetchall()
     await call.message.edit_text(
@@ -871,8 +982,11 @@ async def buy_product(call: CallbackQuery, bot: Bot):
     product_id = int(call.data.split(":")[1])
     with get_db() as conn:
         p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
-    user = db_get_user(call.from_user.id)
+    if not p or not p['is_active']:
+        await call.answer("◦ товар недоступен", show_alert=True)
+        return
 
+    user = db_get_user(call.from_user.id)
     if user['balance'] < p['price']:
         await call.answer(
             f"◦ недостаточно средств\nнужно: {p['price']:.2f}₽\nбаланс: {user['balance']:.2f}₽",
@@ -880,16 +994,24 @@ async def buy_product(call: CallbackQuery, bot: Bot):
         )
         return
 
-    db_update_balance(call.from_user.id, -p['price'])
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Атомарная операция: списание и запись покупки в одной транзакции
     with get_db() as conn:
+        # Проверяем баланс ещё раз внутри транзакции
+        fresh = conn.execute(
+            "SELECT balance FROM users WHERE telegram_id=?", (call.from_user.id,)
+        ).fetchone()
+        if not fresh or fresh['balance'] < p['price']:
+            await call.answer("◦ недостаточно средств", show_alert=True)
+            return
+        conn.execute(
+            "UPDATE users SET balance=balance-?, purchases=purchases+1, total_spent=total_spent+? "
+            "WHERE telegram_id=?",
+            (p['price'], p['price'], call.from_user.id)
+        )
         conn.execute(
             "INSERT INTO purchases (user_id, product_id, price, created_at) VALUES (?,?,?,?)",
             (user['id'], product_id, p['price'], now)
-        )
-        conn.execute(
-            "UPDATE users SET purchases=purchases+1, total_spent=total_spent+? WHERE id=?",
-            (p['price'], user['id'])
         )
         conn.commit()
 
@@ -922,9 +1044,10 @@ async def cmd_admin(msg: Message):
     )
 
 @router.callback_query(F.data == "admin_back")
-async def admin_back(call: CallbackQuery):
+async def admin_back(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+    await state.clear()   # сброс любого admin-стейта
     await call.message.edit_text(
         "✹ <b>Админ панель</b>",
         parse_mode=ParseMode.HTML,
@@ -960,9 +1083,10 @@ async def adm_stats(call: CallbackQuery):
 
 # ── Пользователи ──────────────────────────────
 @router.callback_query(F.data == "adm_users")
-async def adm_users(call: CallbackQuery):
+async def adm_users(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+    await state.clear()
     with get_db() as conn:
         users = conn.execute("SELECT * FROM users ORDER BY id DESC LIMIT 15").fetchall()
     lines = ["☽ <b>Пользователи</b>\n"]
@@ -1041,7 +1165,7 @@ async def adm_payments(call: CallbackQuery):
         pays = conn.execute(
             "SELECT p.*, u.telegram_id FROM payments p "
             "JOIN users u ON u.id=p.user_id "
-            "WHERE p.status='pending' ORDER BY p.created_at DESC"
+            "WHERE p.status IN ('pending','sent') ORDER BY p.created_at DESC"
         ).fetchall()
     if not pays:
         await call.message.edit_text(
@@ -1074,7 +1198,7 @@ async def adm_confirm_payment(call: CallbackQuery, bot: Bot):
     with get_db() as conn:
         pay = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
         u   = conn.execute("SELECT telegram_id FROM users WHERE id=?", (user_db_id,)).fetchone()
-        if pay and pay['status'] == 'pending':
+        if pay and pay['status'] in ('pending', 'sent'):
             conn.execute("UPDATE payments SET status='confirmed' WHERE id=?", (payment_id,))
             conn.commit()
 
@@ -1132,9 +1256,10 @@ async def adm_reject_payment(call: CallbackQuery, bot: Bot):
 
 # ── Категории (admin) ─────────────────────────
 @router.callback_query(F.data == "adm_categories")
-async def adm_categories(call: CallbackQuery):
+async def adm_categories(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+    await state.clear()
     await call.message.edit_text(
         "⬡ <b>Категории</b>",
         parse_mode=ParseMode.HTML,
@@ -1249,9 +1374,10 @@ async def adm_del_category(call: CallbackQuery):
 
 # ── Товары (admin) ────────────────────────────
 @router.callback_query(F.data == "adm_products")
-async def adm_products(call: CallbackQuery):
+async def adm_products(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+    await state.clear()
     await call.message.edit_text(
         "◈ <b>Товары</b>",
         parse_mode=ParseMode.HTML,
@@ -1466,11 +1592,26 @@ async def main():
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    from aiogram.types import BotCommand
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="admin", description="Панель администратора"),
-    ])
+    from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+
+    # Обычным пользователям — только /start
+    await bot.set_my_commands(
+        [BotCommand(command="start", description="Главное меню")],
+        scope=BotCommandScopeDefault()
+    )
+
+    # Администратору — /start + /admin (виден только ему)
+    if ADMIN_ID:
+        try:
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="start", description="Главное меню"),
+                    BotCommand(command="admin", description="Панель администратора"),
+                ],
+                scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+            )
+        except Exception as e:
+            log.warning(f"Could not set admin commands (admin hasn't started bot yet?): {e}")
 
     log.info("🚀 Bot started")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
