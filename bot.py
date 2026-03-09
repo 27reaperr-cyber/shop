@@ -645,7 +645,7 @@ async def support(msg: Message):
     await msg.answer(
         "♱ <b>Поддержка</b>\n\n"
         "Если возникли вопросы:\n\n"
-        "→ @support_username\n\n"
+        "→ @ke9ab\n\n"
         "◦ время ответа до 2 часов",
         parse_mode=ParseMode.HTML
     )
