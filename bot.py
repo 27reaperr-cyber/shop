@@ -8,6 +8,8 @@ import json
 import logging
 import sqlite3
 import os
+import sys
+import shutil
 import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
@@ -93,6 +95,7 @@ def init_db():
             type           TEXT DEFAULT 'product',
             prod_file      TEXT,
             form_questions TEXT,
+            allow_repurchase INTEGER DEFAULT 0,
             FOREIGN KEY (category_id) REFERENCES categories(id)
         );
 
@@ -140,7 +143,8 @@ def init_db():
     for col, definition in [
         ("type",           "TEXT DEFAULT 'product'"),
         ("prod_file",      "TEXT"),
-        ("form_questions", "TEXT"),
+        ("form_questions",    "TEXT"),
+        ("allow_repurchase", "INTEGER DEFAULT 0"),
     ]:
         try:
             c.execute(f"ALTER TABLE products ADD COLUMN {col} {definition}")
@@ -387,6 +391,7 @@ def kb_admin():
         [InlineKeyboardButton(text="✹ Заявки услуг",    callback_data="adm_svc_orders")],
         [InlineKeyboardButton(text="⇢ Рассылка",        callback_data="adm_broadcast")],
         [InlineKeyboardButton(text="☁︎ GIF при старте",  callback_data="adm_start_gif")],
+        [InlineKeyboardButton(text="◈ База данных",      callback_data="adm_database")],
     ])
 
 def kb_admin_products():
@@ -417,12 +422,14 @@ def kb_admin_categories():
     rows.append([InlineKeyboardButton(text="← Назад", callback_data="admin_back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_edit_product(product_id: int, ptype: str = "product"):
+def kb_edit_product(product_id: int, ptype: str = "product", allow_repurchase: int = 0):
+    repurchase_label = "◦ Повт. покупка: ✔ Вкл" if allow_repurchase else "◦ Повт. покупка: ✕ Выкл"
     rows = [
         [InlineKeyboardButton(text="◦ Название",  callback_data=f"adm_pname:{product_id}"),
          InlineKeyboardButton(text="◦ Описание",  callback_data=f"adm_pdesc:{product_id}")],
         [InlineKeyboardButton(text="◦ Цена",      callback_data=f"adm_pprice:{product_id}"),
          InlineKeyboardButton(text="✕ Удалить",   callback_data=f"adm_pdel:{product_id}")],
+        [InlineKeyboardButton(text=repurchase_label, callback_data=f"adm_toggle_repurchase:{product_id}")],
     ]
     if ptype == "product":
         rows.append([InlineKeyboardButton(text="◦ Файл товара", callback_data=f"adm_pfile:{product_id}")])
@@ -455,6 +462,9 @@ def kb_service_order_admin(order_id: int, user_tg_id: int, status: str):
         rows.append([InlineKeyboardButton(
             text="✔ Завершить услугу", callback_data=f"adm_svc_done:{order_id}"
         )])
+        rows.append([InlineKeyboardButton(
+            text="✕ Отменить услугу (возврат)", callback_data=f"adm_svc_cancel:{order_id}"
+        )])
     rows.append([InlineKeyboardButton(
         text="☛ Написать клиенту", url=f"tg://user?id={user_tg_id}"
     )])
@@ -475,6 +485,9 @@ class TransferStates(StatesGroup):
 class ServiceStates(StatesGroup):
     answering = State()  # пользователь отвечает на вопросы формы
 
+class ConfirmStates(StatesGroup):
+    confirm_buy = State()   # ожидание подтверждения покупки
+
 class AdminStates(StatesGroup):
     give_balance_id      = State()
     give_balance_amount  = State()
@@ -494,6 +507,7 @@ class AdminStates(StatesGroup):
     edit_prod_form       = State()
     broadcast_text       = State()
     set_start_gif        = State()
+    upload_db            = State()
 
 # ─────────────────────────────────────────────
 #  CRYPTO BOT API
@@ -968,7 +982,8 @@ async def my_purchases(call: CallbackQuery):
     user = db_get_user(call.from_user.id)
     with get_db() as conn:
         purchases = conn.execute(
-            "SELECT pu.*, pr.name AS pname, pr.type AS ptype FROM purchases pu "
+            "SELECT pu.*, pr.name AS pname, pr.type AS ptype, pr.prod_file "
+            "FROM purchases pu "
             "JOIN products pr ON pr.id=pu.product_id "
             "WHERE pu.user_id=? ORDER BY pu.created_at DESC LIMIT 20",
             (user['id'],)
@@ -984,19 +999,45 @@ async def my_purchases(call: CallbackQuery):
             lines.append(f"{icon} {p['pname']} — <b>{p['price']:.2f}₽</b> <i>({date})</i>")
         text = "\n".join(lines)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="← Назад", callback_data="profile_back")]
-    ])
+    kb_rows = []
     # Если есть активная услуга — показать статус
     active = db_get_active_service(user['id'])
     if active:
         status_map = {"pending": "⏳ ожидает", "active": "⇢ в работе"}
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"♱ {active['pname']} — {status_map.get(active['status'], active['status'])}",
-                                  callback_data=f"svc_status:{active['id']}")],
-            [InlineKeyboardButton(text="← Назад", callback_data="profile_back")],
-        ])
-    await call.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        kb_rows.append([InlineKeyboardButton(
+            text=f"♱ {active['pname']} — {status_map.get(active['status'], active['status'])}",
+            callback_data=f"svc_status:{active['id']}"
+        )])
+    # Кнопки «Получить файл» для товаров с загруженным файлом (уникальные product_id)
+    seen_products = set()
+    for p in purchases:
+        if p['ptype'] == 'product' and p['prod_file'] and p['product_id'] not in seen_products:
+            seen_products.add(p['product_id'])
+            kb_rows.append([InlineKeyboardButton(
+                text=f"◦ Получить файл: {p['pname'][:28]}",
+                callback_data=f"resend_file:{p['product_id']}"
+            )])
+    kb_rows.append([InlineKeyboardButton(text="← Назад", callback_data="profile_back")])
+    await call.message.edit_text(text, parse_mode=ParseMode.HTML,
+                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+@router.callback_query(F.data.startswith("resend_file:"))
+async def resend_file(call: CallbackQuery, bot: Bot):
+    """Повторно отправляет файл товара пользователю из раздела Мои Покупки."""
+    product_id = int(call.data.split(":")[1])
+    user = db_get_user(call.from_user.id)
+    # Проверяем что пользователь реально покупал этот товар
+    if not db_already_purchased(user['id'], product_id):
+        await call.answer("◦ этот товар не найден в ваших покупках", show_alert=True); return
+    with get_db() as conn:
+        p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not p or not p['prod_file']:
+        await call.answer("◦ файл для этого товара пока не загружен", show_alert=True); return
+    await call.answer("◦ отправляем файл…")
+    await send_product_file(
+        bot, call.from_user.id, p['prod_file'],
+        caption=f"◦ файл к товару <b>{p['name']}</b>"
+    )
 
 @router.callback_query(F.data.startswith("svc_status:"))
 async def svc_status(call: CallbackQuery):
@@ -1008,16 +1049,66 @@ async def svc_status(call: CallbackQuery):
         ).fetchone()
     if not order:
         await call.answer("◦ заказ не найден", show_alert=True); return
-    status_map = {"pending": "⏳ ожидает рассмотрения", "active": "⇢ выполняется", "done": "✔ завершена"}
+    status_map = {"pending": "⏳ ожидает рассмотрения", "active": "⇢ выполняется", "done": "✔ завершена", "cancelled": "✕ отменена"}
+    kb_rows = []
+    # Пользователь может отменить только pending-заявку (ещё не взята в работу)
+    if order['status'] == 'pending':
+        kb_rows.append([InlineKeyboardButton(
+            text="✕ Отменить услугу (возврат средств)",
+            callback_data=f"user_svc_cancel:{order_id}"
+        )])
+    kb_rows.append([InlineKeyboardButton(text="← Назад", callback_data="my_purchases")])
     await call.message.edit_text(
         f"♱ <b>{order['pname']}</b>\n{'─'*22}\n"
         f"◦ статус: <b>{status_map.get(order['status'], order['status'])}</b>\n\n"
         f"◦ администратор свяжется с вами для уточнения деталей",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    )
+
+@router.callback_query(F.data.startswith("user_svc_cancel:"))
+async def user_svc_cancel(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Пользователь отменяет услугу (только pending)."""
+    order_id = int(call.data.split(":")[1])
+    await state.clear()
+    with get_db() as conn:
+        order = conn.execute("SELECT * FROM service_orders WHERE id=?", (order_id,)).fetchone()
+        if not order or order['status'] != 'pending':
+            await call.answer("◦ отмена недоступна — услуга уже взята в работу", show_alert=True); return
+        p = conn.execute("SELECT * FROM products WHERE id=?", (order['product_id'],)).fetchone()
+        # Возвращаем деньги
+        conn.execute("UPDATE service_orders SET status='cancelled' WHERE id=?", (order_id,))
+        conn.execute(
+            "UPDATE users SET balance=balance+?, purchases=purchases-1, total_spent=total_spent-? WHERE id=?",
+            (p['price'], p['price'], order['user_id'])
+        )
+        conn.execute(
+            "DELETE FROM purchases WHERE user_id=? AND product_id=? AND id=("
+            "SELECT id FROM purchases WHERE user_id=? AND product_id=? ORDER BY id DESC LIMIT 1)",
+            (order['user_id'], order['product_id'], order['user_id'], order['product_id'])
+        )
+        conn.commit()
+        u = conn.execute("SELECT telegram_id FROM users WHERE id=?", (order['user_id'],)).fetchone()
+    await call.message.edit_text(
+        f"✕ <b>Услуга отменена</b>\n\n"
+        f"◦ <b>{p['price']:.2f}₽</b> возвращены на ваш баланс",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="← Назад", callback_data="my_purchases")]
+            [InlineKeyboardButton(text="← в каталог", callback_data="catalog")]
         ])
     )
+    # Уведомляем администратора
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"✕ <b>Услуга отменена пользователем</b>\n{'─'*22}\n"
+            f"◦ Заявка #{order_id}: <b>{p['name']}</b>\n"
+            f"◦ Пользователь: <a href='tg://user?id={u['telegram_id']}'>{u['telegram_id']}</a>\n"
+            f"◦ Возврат: <b>{p['price']:.2f}₽</b>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 #  КАТАЛОГ
@@ -1081,17 +1172,23 @@ async def show_product(call: CallbackQuery):
     user = db_get_user(call.from_user.id)
     with get_db() as conn:
         p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
-    ptype = p['type'] or 'product'
-    type_badge = "♱ Услуга" if ptype == 'service' else "◦ Товар"
+    ptype   = p['type'] or 'product'
+    type_badge     = "♱ Услуга" if ptype == 'service' else "◦ Товар"
+    allow_repurchase = p['allow_repurchase'] or 0
     already = db_already_purchased(user['id'], product_id) if user else False
-    if already:
+    # Блокируем повторную покупку только если allow_repurchase выключен
+    if already and not allow_repurchase:
+        label = "✔ Уже куплено"
+        if ptype == 'service':
+            label = "✔ Услуга уже заказана"
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✔ Уже куплено", callback_data="noop")],
+            [InlineKeyboardButton(text=label, callback_data="noop")],
             [InlineKeyboardButton(text="← Назад", callback_data=f"cat:{p['category_id']}")],
         ])
+        badge_note = "\n◦ <i>вы уже приобрели этот товар</i>"
     else:
         kb = kb_buy_product(product_id, p['category_id'], ptype)
-    badge_note = "\n◦ <i>вы уже приобрели этот товар</i>" if already else ""
+        badge_note = ("\n◦ <i>повторная покупка разрешена</i>" if already and allow_repurchase else "")
     await call.message.edit_text(
         f"{'♱' if ptype=='service' else '◈'} <b>{p['name']}</b>\n"
         f"{'─'*22}\n"
@@ -1107,9 +1204,9 @@ async def show_product(call: CallbackQuery):
 async def noop(call: CallbackQuery):
     await call.answer()
 
-# ── Покупка ───────────────────────────────────
+# ── Покупка: шаг 1 — показываем подтверждение ──
 @router.callback_query(F.data.startswith("buy:"))
-async def buy_product(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def buy_product(call: CallbackQuery, state: FSMContext):
     product_id = int(call.data.split(":")[1])
     with get_db() as conn:
         p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
@@ -1118,9 +1215,10 @@ async def buy_product(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     user  = db_get_user(call.from_user.id)
     ptype = p['type'] or 'product'
+    allow_repurchase = p['allow_repurchase'] or 0
 
-    # Проверка: уже куплено
-    if db_already_purchased(user['id'], product_id):
+    # Проверка: уже куплено (только если повторная покупка выключена)
+    if db_already_purchased(user['id'], product_id) and not allow_repurchase:
         await call.answer("◦ вы уже приобрели этот товар", show_alert=True); return
 
     # Блокировка при активной услуге
@@ -1132,6 +1230,44 @@ async def buy_product(call: CallbackQuery, state: FSMContext, bot: Bot):
         await call.answer(
             f"◦ недостаточно средств\nнужно: {p['price']:.2f}₽\nбаланс: {user['balance']:.2f}₽",
             show_alert=True); return
+
+    # Сохраняем данные и показываем подтверждение
+    await state.update_data(confirm_product_id=product_id)
+    await state.set_state(ConfirmStates.confirm_buy)
+    type_word  = "услуги" if ptype == 'service' else "товара"
+    action_btn = "✔ Заказать услугу" if ptype == 'service' else "✔ Подтвердить покупку"
+    await call.message.edit_text(
+        f"◦ <b>Подтверждение {type_word}</b>\n{'─'*22}\n"
+        f"{'♱' if ptype=='service' else '◈'} <b>{p['name']}</b>\n\n"
+        f"✯ Цена: <b>{p['price']:.2f}₽</b>\n"
+        f"◦ Баланс после: <b>{user['balance'] - p['price']:.2f}₽</b>\n\n"
+        f"☛ подтвердите покупку",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=action_btn,   callback_data=f"buy_confirm:{product_id}")],
+            [InlineKeyboardButton(text="✕ Отмена",   callback_data=f"product:{product_id}")],
+        ])
+    )
+
+# ── Покупка: шаг 2 — подтверждение, реальная транзакция ──
+@router.callback_query(F.data.startswith("buy_confirm:"), ConfirmStates.confirm_buy)
+async def buy_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
+    product_id = int(call.data.split(":")[1])
+    await state.clear()
+
+    with get_db() as conn:
+        p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not p or not p['is_active']:
+        await call.answer("◦ товар недоступен", show_alert=True); return
+
+    user  = db_get_user(call.from_user.id)
+    ptype = p['type'] or 'product'
+    allow_repurchase = p['allow_repurchase'] or 0
+
+    if db_already_purchased(user['id'], product_id) and not allow_repurchase:
+        await call.answer("◦ вы уже приобрели этот товар", show_alert=True); return
+    if db_has_active_service(user['id']):
+        await call.answer("◦ у вас есть активная услуга", show_alert=True); return
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # Атомарное списание
@@ -1163,7 +1299,6 @@ async def buy_product(call: CallbackQuery, state: FSMContext, bot: Bot):
                 [InlineKeyboardButton(text="← в каталог", callback_data="catalog")]
             ])
         )
-        # Отправляем файл если загружен
         if p['prod_file']:
             await send_product_file(
                 bot, call.from_user.id, p['prod_file'],
@@ -1188,17 +1323,18 @@ async def buy_product(call: CallbackQuery, state: FSMContext, bot: Bot):
                 pass
 
         if not questions:
-            # Нет формы — сразу уведомляем и блокируем
             await call.message.edit_text(
                 f"✔ <b>Услуга оформлена</b>\n\n"
                 f"◦ услуга: <b>{p['name']}</b>\n"
                 f"◦ списано: <b>{p['price']:.2f}₽</b>\n\n"
                 f"♱ администратор свяжется с вами в ближайшее время",
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◦ Статус услуги", callback_data=f"svc_status:{order_id}")]
+                ])
             )
             await _notify_admin_service(bot, call.from_user, p, order_id, {})
         else:
-            # Запускаем форму
             await state.update_data(
                 svc_order_id=order_id,
                 svc_product_name=p['name'],
@@ -1490,8 +1626,12 @@ async def adm_confirm_payment(call: CallbackQuery, bot: Bot):
                 f"✔ платёж подтверждён. баланс пополнен на <b>{pay['amount']:.2f}₽</b>",
                 parse_mode=ParseMode.HTML)
         except Exception: pass
-        await call.message.edit_text(f"✔ платёж #{payment_id} подтверждён")
-    await call.answer()
+        try:
+            await call.message.delete()
+        except Exception:
+            await call.message.edit_text(f"✔ платёж #{payment_id} подтверждён")
+        await bot.send_message(ADMIN_ID, f"✔ платёж #{payment_id} подтверждён — {pay['amount']:.2f}₽")
+    await call.answer("✔ подтверждено")
 
 @router.callback_query(F.data.startswith("adm_reject:"))
 async def adm_reject_payment(call: CallbackQuery, bot: Bot):
@@ -1508,8 +1648,12 @@ async def adm_reject_payment(call: CallbackQuery, bot: Bot):
             await bot.send_message(u['telegram_id'],
                 "✕ ваш платёж отклонён. обратитесь в поддержку.")
         except Exception: pass
-    await call.message.edit_text(f"✕ платёж #{payment_id} отклонён")
-    await call.answer()
+    try:
+        await call.message.delete()
+    except Exception:
+        await call.message.edit_text(f"✕ платёж #{payment_id} отклонён")
+    await bot.send_message(ADMIN_ID, f"✕ платёж #{payment_id} отклонён")
+    await call.answer("✕ отклонено")
 
 # ── Заявки услуг (admin) ──────────────────────
 @router.callback_query(F.data == "adm_svc_orders")
@@ -1604,6 +1748,48 @@ async def adm_svc_done(call: CallbackQuery, bot: Bot):
                 parse_mode=ParseMode.HTML)
         except Exception: pass
     await call.message.edit_text(f"✔ услуга #{order_id} завершена. пользователь разблокирован.")
+    await call.answer()
+
+# ── Отмена услуги администратором ────────────
+@router.callback_query(F.data.startswith("adm_svc_cancel:"))
+async def adm_svc_cancel(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user.id): return
+    order_id = int(call.data.split(":")[1])
+    with get_db() as conn:
+        order = conn.execute("SELECT * FROM service_orders WHERE id=?", (order_id,)).fetchone()
+        if not order or order['status'] in ('done', 'cancelled'):
+            await call.answer("◦ уже завершено или отменено", show_alert=True); return
+        p = conn.execute("SELECT * FROM products WHERE id=?", (order['product_id'],)).fetchone()
+        u = conn.execute("SELECT * FROM users WHERE id=?", (order['user_id'],)).fetchone()
+        # Возвращаем деньги пользователю
+        conn.execute("UPDATE service_orders SET status='cancelled' WHERE id=?", (order_id,))
+        conn.execute(
+            "UPDATE users SET balance=balance+?, purchases=purchases-1, total_spent=total_spent-? WHERE id=?",
+            (p['price'], p['price'], order['user_id'])
+        )
+        conn.execute(
+            "DELETE FROM purchases WHERE user_id=? AND product_id=? AND id=("
+            "SELECT id FROM purchases WHERE user_id=? AND product_id=? ORDER BY id DESC LIMIT 1)",
+            (order['user_id'], order['product_id'], order['user_id'], order['product_id'])
+        )
+        conn.commit()
+    # Уведомляем пользователя
+    if u:
+        try:
+            await bot.send_message(
+                u['telegram_id'],
+                f"✕ <b>Ваша услуга отменена администратором</b>\n\n"
+                f"♱ <b>{p['name']}</b>\n\n"
+                f"◦ <b>{p['price']:.2f}₽</b> возвращены на ваш баланс\n"
+                f"◦ каталог снова доступен",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+    await call.message.edit_text(
+        f"✕ услуга #{order_id} отменена. <b>{p['price']:.2f}₽</b> возвращены пользователю.",
+        parse_mode=ParseMode.HTML
+    )
     await call.answer()
 
 # ── Категории (admin) ─────────────────────────
@@ -1803,14 +1989,17 @@ async def adm_edit_prod(call: CallbackQuery):
             form_text = f"\n◦ вопросов в форме: {len(qs)}"
         except Exception:
             pass
+    allow_repurchase = p['allow_repurchase'] or 0
+    repurchase_text  = "◦ повт. покупка: ✔ разрешена" if allow_repurchase else "◦ повт. покупка: ✕ запрещена"
     await call.message.edit_text(
         f"{'♱' if ptype=='service' else '◈'} <b>{p['name']}</b>\n{'─'*22}\n"
         f"{p['description']}\n\n"
         f"◦ тип: {type_text}\n"
         f"✯ {p['price']:.2f}₽\n"
+        f"{repurchase_text}\n"
         f"{''+file_text if ptype=='product' else ''+form_text}",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_edit_product(prod_id, ptype)
+        reply_markup=kb_edit_product(prod_id, ptype, allow_repurchase)
     )
 
 @router.callback_query(F.data.startswith("adm_pname:"))
@@ -2032,6 +2221,42 @@ async def adm_del_product(call: CallbackQuery):
         ])
     )
 
+# ── Переключение повторной покупки ───────────
+@router.callback_query(F.data.startswith("adm_toggle_repurchase:"))
+async def adm_toggle_repurchase(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    prod_id = int(call.data.split(":")[1])
+    with get_db() as conn:
+        p = conn.execute("SELECT * FROM products WHERE id=?", (prod_id,)).fetchone()
+        new_val = 0 if (p['allow_repurchase'] or 0) else 1
+        conn.execute("UPDATE products SET allow_repurchase=? WHERE id=?", (new_val, prod_id))
+        conn.commit()
+        p = conn.execute("SELECT * FROM products WHERE id=?", (prod_id,)).fetchone()
+    status = "✔ разрешена" if new_val else "✕ запрещена"
+    await call.answer(f"Повторная покупка: {status}", show_alert=False)
+    # Обновляем меню редактирования
+    ptype = p['type'] or 'product'
+    type_text = "♱ Услуга" if ptype == 'service' else "◦ Товар"
+    file_text = "◦ файл: загружен ✔" if p['prod_file'] else "◦ файл: не загружен"
+    form_text = ""
+    if ptype == 'service' and p['form_questions']:
+        try:
+            qs = json.loads(p['form_questions'])
+            form_text = f"\n◦ вопросов в форме: {len(qs)}"
+        except Exception:
+            pass
+    repurchase_text = "◦ повт. покупка: ✔ разрешена" if new_val else "◦ повт. покупка: ✕ запрещена"
+    await call.message.edit_text(
+        f"{'♱' if ptype=='service' else '◈'} <b>{p['name']}</b>\n{'─'*22}\n"
+        f"{p['description']}\n\n"
+        f"◦ тип: {type_text}\n"
+        f"✯ {p['price']:.2f}₽\n"
+        f"{repurchase_text}\n"
+        f"{''+file_text if ptype=='product' else ''+form_text}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_edit_product(prod_id, ptype, new_val)
+    )
+
 # ── GIF стартового сообщения ──────────────────
 @router.callback_query(F.data == "adm_start_gif")
 async def adm_start_gif_menu(call: CallbackQuery):
@@ -2091,6 +2316,104 @@ async def adm_gif_delete(call: CallbackQuery, state: FSMContext):
         ])
     )
     await call.answer()
+
+# ── База данных (backup / restore) ───────────
+@router.callback_query(F.data == "adm_database")
+async def adm_database(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    import os as _os
+    db_size = _os.path.getsize(DB_PATH) if _os.path.exists(DB_PATH) else 0
+    await call.message.edit_text(
+        f"◈ <b>База данных</b>\n{'─'*22}\n"
+        f"◦ файл: <code>{DB_PATH}</code>\n"
+        f"◦ размер: <b>{db_size / 1024:.1f} КБ</b>\n\n"
+        f"☛ <b>Скачать</b> — получить текущую БД файлом\n"
+        f"☛ <b>Загрузить</b> — заменить БД и перезапустить бота",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◦ Скачать БД",   callback_data="adm_db_download")],
+            [InlineKeyboardButton(text="◦ Загрузить БД", callback_data="adm_db_upload")],
+            [InlineKeyboardButton(text="← Назад",        callback_data="admin_back")],
+        ])
+    )
+
+@router.callback_query(F.data == "adm_db_download")
+async def adm_db_download(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user.id): return
+    import os as _os
+    if not _os.path.exists(DB_PATH):
+        await call.answer("◦ файл БД не найден", show_alert=True); return
+    await call.answer("◦ отправляем файл…")
+    from aiogram.types import FSInputFile
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    await bot.send_document(
+        ADMIN_ID,
+        FSInputFile(DB_PATH, filename=f"shop_backup_{ts}.db"),
+        caption=f"◈ <b>Бэкап БД</b>\n◦ {ts}",
+        parse_mode=ParseMode.HTML
+    )
+
+@router.callback_query(F.data == "adm_db_upload")
+async def adm_db_upload(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.upload_db)
+    await call.message.edit_text(
+        "◈ <b>Загрузка базы данных</b>\n\n"
+        "◦ отправь .db файл (бэкап shop.db)\n"
+        "◦ после загрузки бот <b>перезапустится</b>\n\n"
+        "⚠️ текущая БД будет заменена!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Отмена", callback_data="adm_database")]
+        ])
+    )
+
+@router.message(AdminStates.upload_db, F.document)
+async def adm_db_receive(msg: Message, state: FSMContext, bot: Bot):
+    if not is_admin(msg.from_user.id): return
+    doc = msg.document
+    if not (doc.file_name or "").endswith(".db"):
+        await msg.answer("◦ нужен файл с расширением <b>.db</b>", parse_mode=ParseMode.HTML); return
+
+    await state.clear()
+    # Скачиваем файл во временное место
+    tmp_path = DB_PATH + ".incoming"
+    file = await bot.get_file(doc.file_id)
+    await bot.download_file(file.file_path, destination=tmp_path)
+
+    # Проверяем что это валидная SQLite БД
+    try:
+        import sqlite3 as _sql
+        test_conn = _sql.connect(tmp_path)
+        test_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        test_conn.close()
+    except Exception as e:
+        import os as _os
+        _os.remove(tmp_path)
+        await msg.answer(f"✕ файл повреждён или не является SQLite БД\n◦ {e}",
+                         parse_mode=ParseMode.HTML); return
+
+    # Создаём бэкап текущей БД
+    import os as _os, shutil as _sh
+    if _os.path.exists(DB_PATH):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _sh.copy2(DB_PATH, DB_PATH + f".bak_{ts}")
+
+    # Заменяем БД
+    _sh.move(tmp_path, DB_PATH)
+    await msg.answer(
+        "✔ <b>База данных заменена!</b>\n\n"
+        "◦ бот перезапускается…\n"
+        "◦ через несколько секунд он снова будет доступен",
+        parse_mode=ParseMode.HTML
+    )
+    # Перезапускаем процесс
+    await asyncio.sleep(1.5)
+    _os.execv(sys.executable, [sys.executable] + sys.argv)
+
+@router.message(AdminStates.upload_db)
+async def adm_db_wrong_file(msg: Message):
+    await msg.answer("◦ нужно прислать <b>.db файл</b> (документ)", parse_mode=ParseMode.HTML)
 
 # ── Рассылка ──────────────────────────────────
 @router.callback_query(F.data == "adm_broadcast")
