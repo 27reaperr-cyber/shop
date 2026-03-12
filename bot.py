@@ -23,6 +23,7 @@ from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto,
+    ReactionTypeEmoji,
 )
 
 load_dotenv()
@@ -117,6 +118,7 @@ def init_db():
             method     TEXT NOT NULL,
             status     TEXT DEFAULT 'pending',
             invoice_id TEXT,
+            receipt_file TEXT,
             created_at TEXT NOT NULL
         );
 
@@ -144,10 +146,10 @@ def init_db():
 
     # Migrate existing DB: add new columns if they don't exist
     for col, definition in [
-        ("type",           "TEXT DEFAULT 'product'"),
-        ("photo",          "TEXT"),
-        ("prod_file",      "TEXT"),
-        ("form_questions",    "TEXT"),
+        ("type",             "TEXT DEFAULT 'product'"),
+        ("photo",            "TEXT"),
+        ("prod_file",        "TEXT"),
+        ("form_questions",   "TEXT"),
         ("allow_repurchase", "INTEGER DEFAULT 0"),
     ]:
         try:
@@ -155,6 +157,13 @@ def init_db():
             conn.commit()
         except Exception:
             pass  # column already exists
+
+    # Migrate payments: добавить файл чека
+    try:
+        c.execute("ALTER TABLE payments ADD COLUMN receipt_file TEXT")
+        conn.commit()
+    except Exception:
+        pass
 
     # Seed demo data if empty
     if not c.execute("SELECT id FROM categories LIMIT 1").fetchone():
@@ -705,6 +714,17 @@ async def cmd_start(msg: Message):
     if ref_db_id:
         db_add_referral(ref_db_id, user['id'])
 
+    # Реакция на /start
+    try:
+        await msg.bot.set_message_reaction(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            reaction=[ReactionTypeEmoji(emoji="🔥")],
+            is_big=True
+        )
+    except Exception as e:
+        log.debug(f"Set reaction failed: {e}")
+
     text = (
         f"☁︎ Добро пожаловать, <b>{msg.from_user.first_name}</b> :D\n\n"
         f"❝dreinn.shop❞\n\n"
@@ -878,9 +898,13 @@ async def topup_bank_receipt(msg: Message, state: FSMContext, bot: Bot):
     if not payment_id:
         await state.clear(); await msg.answer("◦ что-то пошло не так, начни заново"); return
 
+    file_id, file_type = extract_file_from_msg(msg)
+    raw_file = encode_file(file_id, file_type) if file_id else None
+
     with get_db() as conn:
         updated = conn.execute(
-            "UPDATE payments SET status='sent' WHERE id=? AND status='pending'", (payment_id,)
+            "UPDATE payments SET status='sent', receipt_file=? WHERE id=? AND status='pending'",
+            (raw_file, payment_id)
         ).rowcount
         conn.commit()
     if not updated:
@@ -1646,6 +1670,20 @@ async def render_payment_view(message, payment_id: int, page: int = 0):
         f"◦ дата: {pay['created_at'][:16]}"
     )
     kb = kb_confirm_payment(pay['id'], pay['user_id'], back_cb=f"adm_pay_page:{page}", page=page)
+    file_type, file_id = decode_file(pay['receipt_file']) if pay['receipt_file'] else (None, None)
+    if file_id:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            if file_type == "photo":
+                await message.answer_photo(file_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            else:
+                await message.answer_document(file_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        except Exception as e:
+            log.error(f"Cannot send receipt preview: {e}")
     await safe_edit(message, text, reply_markup=kb)
 
 async def render_svc_menu(message, page: int = 0):
