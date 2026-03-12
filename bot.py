@@ -22,7 +22,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto,
 )
 
 load_dotenv()
@@ -38,6 +38,8 @@ BANK_NAME       = os.getenv("BANK_NAME", "Т-Банк")
 BANK_RECEIVER   = os.getenv("BANK_RECEIVER", "Имя Ф.")
 BOT_USERNAME    = os.getenv("BOT_USERNAME", "myshopbot")
 REFERRAL_PCT    = float(os.getenv("REFERRAL_PCT", "5"))
+TRANSFER_FEE_PCT = float(os.getenv("TRANSFER_FEE_PCT", "2.5"))  # комиссия на переводы баланса, %
+TRANSFER_FEE_MIN = float(os.getenv("TRANSFER_FEE_MIN", "1"))    # минимальная комиссия
 
 DB_PATH = "shop.db"
 
@@ -89,6 +91,7 @@ def init_db():
             category_id    INTEGER NOT NULL,
             name           TEXT NOT NULL,
             description    TEXT,
+            photo          TEXT,
             price          REAL NOT NULL,
             stock          INTEGER DEFAULT -1,
             is_active      INTEGER DEFAULT 1,
@@ -142,6 +145,7 @@ def init_db():
     # Migrate existing DB: add new columns if they don't exist
     for col, definition in [
         ("type",           "TEXT DEFAULT 'product'"),
+        ("photo",          "TEXT"),
         ("prod_file",      "TEXT"),
         ("form_questions",    "TEXT"),
         ("allow_repurchase", "INTEGER DEFAULT 0"),
@@ -198,6 +202,29 @@ def db_update_balance(telegram_id: int, delta: float):
             "UPDATE users SET balance = balance + ? WHERE telegram_id=?", (delta, telegram_id)
         )
         conn.commit()
+
+def db_cancel_pending_payments(telegram_id: int, payment_id: int | None = None) -> int:
+    """
+    Помечает ожидающие/отправленные платежи пользователя как отменённые,
+    чтобы они не болтались в админке после отказа.
+    Если передан payment_id — отменяем только его.
+    Возвращает количество обновлённых записей.
+    """
+    with get_db() as conn:
+        if payment_id:
+            cur = conn.execute(
+                "UPDATE payments SET status='cancelled' WHERE id=? AND status IN ('pending','sent')",
+                (payment_id,)
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE payments SET status='cancelled' WHERE user_id=("
+                "SELECT id FROM users WHERE telegram_id=?"
+                ") AND status IN ('pending','sent')",
+                (telegram_id,)
+            )
+        conn.commit()
+        return cur.rowcount
 
 def db_add_referral(referrer_db_id: int, user_db_id: int):
     with get_db() as conn:
@@ -314,6 +341,46 @@ def extract_file_from_msg(msg: Message):
         return msg.document.file_id, "document"
     return None, None
 
+def extract_inline_buttons(text: str):
+    """
+    Ищет конструкции вида [[Текст|https://link]] и возвращает
+    (очищенный_текст, keyboard_rows).
+    """
+    import re
+    if not text:
+        return text, []
+    buttons = []
+    pattern = re.compile(r"\[\[([^|\]]+)\|([^\]]+)\]\]")
+
+    def _repl(match):
+        buttons.append(InlineKeyboardButton(text=match.group(1).strip(), url=match.group(2).strip()))
+        return ""
+
+    cleaned = pattern.sub(_repl, text).strip()
+    # Группируем по 2 кнопки в строке для компактности
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)] if buttons else []
+    return cleaned, rows
+
+async def safe_edit(message, text: str, reply_markup=None, parse_mode=ParseMode.HTML):
+    """
+    Аккуратно обновляет сообщение (учитывая, что оно может быть с медиа).
+    """
+    try:
+        await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        await message.edit_caption(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
 # ─────────────────────────────────────────────
 #  KEYBOARDS
 # ─────────────────────────────────────────────
@@ -341,14 +408,14 @@ def kb_topup():
 def kb_bank_paid(payment_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✔ Я оплатил — прислать чек", callback_data=f"bank_paid:{payment_id}")],
-        [InlineKeyboardButton(text="← Отмена",                   callback_data="topup")],
+        [InlineKeyboardButton(text="← Отмена",                   callback_data=f"cancel_payment:{payment_id}")],
     ])
 
 def kb_crypto(invoice_url: str, payment_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✦ Оплатить",         url=invoice_url)],
         [InlineKeyboardButton(text="⟳ Проверить оплату", callback_data=f"check_crypto:{payment_id}")],
-        [InlineKeyboardButton(text="← Отмена",           callback_data="topup")],
+        [InlineKeyboardButton(text="← Отмена",           callback_data=f"cancel_payment:{payment_id}")],
     ])
 
 def kb_categories(cats):
@@ -430,6 +497,7 @@ def kb_edit_product(product_id: int, ptype: str = "product", allow_repurchase: i
         [InlineKeyboardButton(text="◦ Цена",      callback_data=f"adm_pprice:{product_id}"),
          InlineKeyboardButton(text="✕ Удалить",   callback_data=f"adm_pdel:{product_id}")],
         [InlineKeyboardButton(text=repurchase_label, callback_data=f"adm_toggle_repurchase:{product_id}")],
+        [InlineKeyboardButton(text="◦ Обложка / фото", callback_data=f"adm_pphoto:{product_id}")],
     ]
     if ptype == "product":
         rows.append([InlineKeyboardButton(text="◦ Файл товара", callback_data=f"adm_pfile:{product_id}")])
@@ -446,13 +514,17 @@ def kb_edit_category(cat_id: int):
         [InlineKeyboardButton(text="← Назад",    callback_data="adm_categories")],
     ])
 
-def kb_confirm_payment(payment_id: int, user_db_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✔ Подтвердить", callback_data=f"adm_confirm:{payment_id}:{user_db_id}"),
-        InlineKeyboardButton(text="✕ Отклонить",   callback_data=f"adm_reject:{payment_id}:{user_db_id}"),
-    ]])
+def kb_confirm_payment(payment_id: int, user_db_id: int, back_cb: str | None = None, page: int | None = None):
+    page_suffix = f":{page}" if page is not None else ""
+    rows = [[
+        InlineKeyboardButton(text="✔ Подтвердить", callback_data=f"adm_confirm:{payment_id}:{user_db_id}{page_suffix}"),
+        InlineKeyboardButton(text="✕ Отклонить",   callback_data=f"adm_reject:{payment_id}:{user_db_id}{page_suffix}"),
+    ]]
+    if back_cb:
+        rows.append([InlineKeyboardButton(text="← К заявкам", callback_data=back_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_service_order_admin(order_id: int, user_tg_id: int, status: str):
+def kb_service_order_admin(order_id: int, user_tg_id: int, status: str, back_cb: str | None = None):
     rows = []
     if status == "pending":
         rows.append([InlineKeyboardButton(
@@ -468,6 +540,8 @@ def kb_service_order_admin(order_id: int, user_tg_id: int, status: str):
     rows.append([InlineKeyboardButton(
         text="☛ Написать клиенту", url=f"tg://user?id={user_tg_id}"
     )])
+    if back_cb:
+        rows.append([InlineKeyboardButton(text="← К заявкам", callback_data=back_cb)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ─────────────────────────────────────────────
@@ -503,6 +577,7 @@ class AdminStates(StatesGroup):
     edit_prod_name       = State()
     edit_prod_desc       = State()
     edit_prod_price      = State()
+    edit_prod_photo      = State()
     edit_prod_file       = State()
     edit_prod_form       = State()
     broadcast_text       = State()
@@ -700,10 +775,36 @@ async def profile_back(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "topup")
 async def topup_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
+    db_cancel_pending_payments(call.from_user.id)  # очищаем зависшие незавершённые заявки
     await call.message.edit_text(
         "✦ <b>Пополнение баланса</b>\n\n◦ выбери способ оплаты",
         parse_mode=ParseMode.HTML, reply_markup=kb_topup()
     )
+
+@router.callback_query(F.data.startswith("cancel_payment:"))
+async def cancel_payment(call: CallbackQuery, state: FSMContext):
+    """Пользователь отменяет заявку на оплату — скрываем её из админки."""
+    try:
+        payment_id = int(call.data.split(":")[1])
+    except Exception:
+        await call.answer("◦ заявка не найдена", show_alert=True); return
+    await state.clear()
+    with get_db() as conn:
+        pay = conn.execute(
+            "SELECT p.*, u.telegram_id FROM payments p JOIN users u ON u.id=p.user_id WHERE p.id=?",
+            (payment_id,)
+        ).fetchone()
+    if not pay or pay['telegram_id'] != call.from_user.id:
+        await call.answer("◦ заявка не найдена", show_alert=True); return
+    updated = db_cancel_pending_payments(call.from_user.id, payment_id)
+    if not updated:
+        await call.answer("◦ заявку уже обработали", show_alert=True); return
+    await call.message.edit_text(
+        "✕ <b>Заявка отменена</b>\n\n◦ можешь выбрать другой способ оплаты",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_topup()
+    )
+    await call.answer("Отмена выполнена")
 
 @router.callback_query(F.data == "topup_bank")
 async def topup_bank_start(call: CallbackQuery, state: FSMContext):
@@ -924,7 +1025,9 @@ async def transfer_start(call: CallbackQuery, state: FSMContext):
         await call.answer("◦ передача недоступна — у вас активная услуга", show_alert=True); return
     await state.set_state(TransferStates.target_id)
     await call.message.edit_text(
-        "⇄ <b>Передача баланса</b>\n\n◦ введи Telegram ID получателя",
+        "⇄ <b>Передача баланса</b>\n\n"
+        f"◦ комиссия: <b>{TRANSFER_FEE_PCT:.2f}%</b>, мин. <b>{TRANSFER_FEE_MIN:.2f}₽</b>\n"
+        "◦ введи Telegram ID получателя",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="← Отмена", callback_data="profile_back")]
@@ -944,7 +1047,9 @@ async def transfer_target(msg: Message, state: FSMContext):
     await state.update_data(target_id=target_id)
     await state.set_state(TransferStates.amount)
     await msg.answer(
-        f"◦ переводим пользователю <code>{target_id}</code>\n\n☛ введи сумму:",
+        f"◦ переводим пользователю <code>{target_id}</code>\n"
+        f"◦ комиссия: <b>{TRANSFER_FEE_PCT:.2f}%</b> (мин. {TRANSFER_FEE_MIN:.2f}₽)\n\n"
+        f"☛ введи сумму, списание = сумма + комиссия",
         parse_mode=ParseMode.HTML
     )
 
@@ -960,15 +1065,24 @@ async def transfer_amount(msg: Message, state: FSMContext, bot: Bot):
     data      = await state.get_data()
     target_id = data['target_id']
     sender    = db_get_user(msg.from_user.id)
-    if sender['balance'] < amount:
-        await msg.answer(f"◦ недостаточно средств. баланс: {sender['balance']:.2f}₽")
+    fee = max(TRANSFER_FEE_MIN, amount * TRANSFER_FEE_PCT / 100)
+    total = amount + fee
+    if sender['balance'] < total:
+        await msg.answer(
+            f"◦ недостаточно средств. баланс: {sender['balance']:.2f}₽\n"
+            f"нужно: {total:.2f}₽ (с учётом комиссии {fee:.2f}₽)",
+            parse_mode=ParseMode.HTML
+        )
         await state.clear(); return
 
-    db_update_balance(msg.from_user.id, -amount)
+    db_update_balance(msg.from_user.id, -total)
     db_update_balance(target_id, amount)
     await state.clear()
-    await msg.answer(f"✔ переведено <b>{amount:.2f}₽</b> → <code>{target_id}</code>",
-                     parse_mode=ParseMode.HTML)
+    await msg.answer(
+        f"✔ переведено <b>{amount:.2f}₽</b> → <code>{target_id}</code>\n"
+        f"◦ комиссия: <b>{fee:.2f}₽</b>\n"
+        f"◦ списано: <b>{total:.2f}₽</b>",
+        parse_mode=ParseMode.HTML)
     try:
         await bot.send_message(target_id,
             f"✦ вам переведено <b>{amount:.2f}₽</b> от <code>{msg.from_user.id}</code>",
@@ -1146,8 +1260,9 @@ async def catalog_back(call: CallbackQuery, state: FSMContext):
     await state.clear()
     with get_db() as conn:
         cats = conn.execute("SELECT * FROM categories").fetchall()
-    await call.message.edit_text("✹ <b>Каталог</b>\n\n◦ выбери категорию",
-                                  parse_mode=ParseMode.HTML, reply_markup=kb_categories(cats))
+    await safe_edit(call.message,
+                    "✹ <b>Каталог</b>\n\n◦ выбери категорию",
+                    reply_markup=kb_categories(cats))
 
 @router.callback_query(F.data.startswith("cat:"))
 async def show_category(call: CallbackQuery):
@@ -1159,10 +1274,10 @@ async def show_category(call: CallbackQuery):
         ).fetchall()
     if not prods:
         await call.answer("в этой категории нет товаров", show_alert=True); return
-    await call.message.edit_text(
+    await safe_edit(
+        call.message,
         f"{cat['emoji']} <b>{cat['name']}</b>\n\n"
         f"◦ Товар / ◈ Услуга\n\n◦ выбери позицию",
-        parse_mode=ParseMode.HTML,
         reply_markup=kb_products(prods, cat_id)
     )
 
@@ -1189,15 +1304,28 @@ async def show_product(call: CallbackQuery):
     else:
         kb = kb_buy_product(product_id, p['category_id'], ptype)
         badge_note = ("\n◦ <i>повторная покупка разрешена</i>" if already and allow_repurchase else "")
-    await call.message.edit_text(
+    caption = (
         f"{'♱' if ptype=='service' else '◈'} <b>{p['name']}</b>\n"
         f"{'─'*22}\n"
         f"{p['description']}\n\n"
         f"◦ Тип: {type_badge}\n"
-        f"✯ Цена: <b>{p['price']:.2f}₽</b>{badge_note}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb
+        f"✯ Цена: <b>{p['price']:.2f}₽</b>{badge_note}"
     )
+    photo_type, photo_id = decode_file(p['photo']) if p['photo'] else (None, None)
+    if photo_type == "photo" and photo_id:
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        await call.message.answer_photo(
+            photo_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+    else:
+        await call.message.edit_text(
+            caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
+        )
 
 # ── Заглушка для неактивных кнопок ───────────
 @router.callback_query(F.data == "noop")
@@ -1460,6 +1588,138 @@ async def _notify_admin_service(bot: Bot, from_user, product, order_id: int, qa:
 # ─────────────────────────────────────────────
 #  ADMIN PANEL
 # ─────────────────────────────────────────────
+def _paginate(seq, page: int, per_page: int = 5):
+    start = max(page, 0) * per_page
+    end   = start + per_page
+    return seq[start:end], len(seq), end < len(seq)
+
+async def render_payments_menu(message, page: int = 0):
+    with get_db() as conn:
+        pays = conn.execute(
+            "SELECT p.*, u.telegram_id FROM payments p JOIN users u ON u.id=p.user_id "
+            "WHERE p.status IN ('pending','sent') ORDER BY p.created_at DESC"
+        ).fetchall()
+    if not pays:
+        await safe_edit(
+            message,
+            "✔ нет ожидающих заявок",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="← Назад", callback_data="admin_back")]
+            ])
+        )
+        return
+    chunk, total, has_next = _paginate(pays, page)
+    buttons = []
+    for pay in chunk:
+        buttons.append([InlineKeyboardButton(
+            text=f"#{pay['id']} · {pay['amount']:.0f}₽ · {pay['method']} · {pay['created_at'][:16]}",
+            callback_data=f"adm_pay_view:{page}:{pay['id']}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="←", callback_data=f"adm_pay_page:{page-1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text="Далее →", callback_data=f"adm_pay_page:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="← Админ", callback_data="admin_back")])
+    await safe_edit(
+        message,
+        f"♱ <b>Заявки на оплату</b>\nВсего: <b>{total}</b>\nСтр. {page + 1}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+async def render_payment_view(message, payment_id: int, page: int = 0):
+    with get_db() as conn:
+        pay = conn.execute(
+            "SELECT p.*, u.telegram_id FROM payments p JOIN users u ON u.id=p.user_id WHERE p.id=?",
+            (payment_id,)
+        ).fetchone()
+    if not pay or pay['status'] not in ("pending", "sent"):
+        await render_payments_menu(message, page)
+        return
+    text = (
+        f"♱ <b>Заявка #{pay['id']}</b>\n"
+        f"◦ TG: <code>{pay['telegram_id']}</code>\n"
+        f"◦ сумма: <b>{pay['amount']:.2f}₽</b>\n"
+        f"◦ метод: {pay['method']}\n"
+        f"◦ дата: {pay['created_at'][:16]}"
+    )
+    kb = kb_confirm_payment(pay['id'], pay['user_id'], back_cb=f"adm_pay_page:{page}", page=page)
+    await safe_edit(message, text, reply_markup=kb)
+
+async def render_svc_menu(message, page: int = 0):
+    with get_db() as conn:
+        orders = conn.execute(
+            "SELECT so.*, p.name AS pname, u.telegram_id, u.full_name AS uname, p.price "
+            "FROM service_orders so "
+            "JOIN products p ON p.id=so.product_id "
+            "JOIN users u ON u.id=so.user_id "
+            "WHERE so.status IN ('pending','active') ORDER BY so.created_at DESC"
+        ).fetchall()
+    if not orders:
+        await safe_edit(
+            message,
+            "✔ нет активных заявок на услуги",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="← Назад", callback_data="admin_back")]
+            ])
+        )
+        return
+    chunk, total, has_next = _paginate(orders, page)
+    buttons = []
+    status_map = {"pending": "⏳", "active": "⇢"}
+    for o in chunk:
+        buttons.append([InlineKeyboardButton(
+            text=f"#{o['id']} · {status_map.get(o['status'], o['status'])} · {o['pname'][:24]}",
+            callback_data=f"adm_svc_view:{page}:{o['id']}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="←", callback_data=f"adm_svc_page:{page-1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text="Далее →", callback_data=f"adm_svc_page:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="← Админ", callback_data="admin_back")])
+    await safe_edit(
+        message,
+        f"♱ <b>Заявки услуг</b>\nВсего: <b>{total}</b>\nСтр. {page + 1}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+async def render_svc_view(message, order_id: int, page: int = 0):
+    with get_db() as conn:
+        o = conn.execute(
+            "SELECT so.*, p.name AS pname, p.price, u.telegram_id, u.full_name AS uname "
+            "FROM service_orders so "
+            "JOIN products p ON p.id=so.product_id "
+            "JOIN users u ON u.id=so.user_id "
+            "WHERE so.id=?", (order_id,)
+        ).fetchone()
+    if not o or o['status'] not in ("pending", "active"):
+        await render_svc_menu(message, page)
+        return
+    status_map = {"pending": "⏳ ожидает", "active": "⇢ в работе"}
+    answers_text = ""
+    if o['answers']:
+        try:
+            qa = json.loads(o['answers'])
+            answers_text = "\n" + "\n".join(f"  ❝{q}❞\n  → {a}" for q, a in qa.items())
+        except Exception:
+            pass
+    text = (
+        f"♱ <b>Заявка #{o['id']}</b> — {status_map.get(o['status'], o['status'])}\n"
+        f"◦ клиент: <a href='tg://user?id={o['telegram_id']}'>{o['uname']}</a>\n"
+        f"◦ ID: <code>{o['telegram_id']}</code>\n"
+        f"◦ услуга: <b>{o['pname']}</b>\n"
+        f"◦ сумма: <b>{o['price']:.2f}₽</b>\n"
+        f"◦ дата: {o['created_at'][:16]}"
+        f"{answers_text}"
+    )
+    kb = kb_service_order_admin(o['id'], o['telegram_id'], o['status'], back_cb=f"adm_svc_page:{page}")
+    await safe_edit(message, text, reply_markup=kb)
+
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
@@ -1488,11 +1748,24 @@ async def adm_stats(call: CallbackQuery):
         pending  = conn.execute("SELECT COUNT(*) FROM payments WHERE status IN ('pending','sent')").fetchone()[0]
         svc_pend = conn.execute("SELECT COUNT(*) FROM service_orders WHERE status='pending'").fetchone()[0]
         svc_act  = conn.execute("SELECT COUNT(*) FROM service_orders WHERE status='active'").fetchone()[0]
+        active_bal = conn.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
+        avg_check  = revenue / purch_n if purch_n else 0
+        daily_rev  = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM payments "
+            "WHERE status='confirmed' AND created_at >= date('now','-1 day')"
+        ).fetchone()[0]
+        new_users7 = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE reg_date >= date('now','-7 day')"
+        ).fetchone()[0]
     await call.message.edit_text(
         f"✦ <b>Статистика</b>\n{'─'*22}\n"
         f"◦ пользователей: <b>{users_n}</b>\n"
         f"◦ выручка: <b>{revenue:.2f}₽</b>\n"
         f"◦ покупок: <b>{purch_n}</b>\n"
+        f"◦ средний чек: <b>{avg_check:.2f}₽</b>\n"
+        f"◦ выручка 24ч: <b>{daily_rev:.2f}₽</b>\n"
+        f"◦ активный баланс: <b>{active_bal:.2f}₽</b>\n"
+        f"◦ новые за 7д: <b>{new_users7}</b>\n"
         f"◦ ждут оплаты: <b>{pending}</b>\n"
         f"◦ услуги (ожидают): <b>{svc_pend}</b>\n"
         f"◦ услуги (в работе): <b>{svc_act}</b>",
@@ -1568,28 +1841,22 @@ async def adm_give_balance_amount(msg: Message, state: FSMContext, bot: Bot):
 @router.callback_query(F.data == "adm_payments")
 async def adm_payments(call: CallbackQuery):
     if not is_admin(call.from_user.id): return
-    with get_db() as conn:
-        pays = conn.execute(
-            "SELECT p.*, u.telegram_id FROM payments p JOIN users u ON u.id=p.user_id "
-            "WHERE p.status IN ('pending','sent') ORDER BY p.created_at DESC"
-        ).fetchall()
-    if not pays:
-        await call.message.edit_text(
-            "✔ нет ожидающих заявок",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="← Назад", callback_data="admin_back")]
-            ])
-        ); return
     await call.answer()
-    for pay in pays:
-        await call.message.answer(
-            f"♱ <b>Заявка #{pay['id']}</b>\n"
-            f"◦ TG: <code>{pay['telegram_id']}</code>\n"
-            f"◦ сумма: <b>{pay['amount']:.2f}₽</b>\n"
-            f"◦ метод: {pay['method']}\n◦ дата: {pay['created_at'][:16]}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_confirm_payment(pay['id'], pay['user_id'])
-        )
+    await render_payments_menu(call.message, 0)
+
+@router.callback_query(F.data.startswith("adm_pay_page:"))
+async def adm_pay_page(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    page = int(call.data.split(":")[1])
+    await call.answer()
+    await render_payments_menu(call.message, page)
+
+@router.callback_query(F.data.startswith("adm_pay_view:"))
+async def adm_pay_view(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    _, page, pid = call.data.split(":")
+    await call.answer()
+    await render_payment_view(call.message, int(pid), int(page))
 
 @router.callback_query(F.data.startswith("adm_confirm:"))
 async def adm_confirm_payment(call: CallbackQuery, bot: Bot):
@@ -1597,6 +1864,7 @@ async def adm_confirm_payment(call: CallbackQuery, bot: Bot):
     parts      = call.data.split(":")
     payment_id = int(parts[1])
     user_db_id = int(parts[2])
+    page       = int(parts[3]) if len(parts) > 3 else None
 
     with get_db() as conn:
         pay = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
@@ -1626,11 +1894,14 @@ async def adm_confirm_payment(call: CallbackQuery, bot: Bot):
                 f"✔ платёж подтверждён. баланс пополнен на <b>{pay['amount']:.2f}₽</b>",
                 parse_mode=ParseMode.HTML)
         except Exception: pass
+        await bot.send_message(ADMIN_ID, f"✔ платёж #{payment_id} подтверждён — {pay['amount']:.2f}₽")
+    if page is not None:
+        await render_payments_menu(call.message, page)
+    else:
         try:
             await call.message.delete()
         except Exception:
             await call.message.edit_text(f"✔ платёж #{payment_id} подтверждён")
-        await bot.send_message(ADMIN_ID, f"✔ платёж #{payment_id} подтверждён — {pay['amount']:.2f}₽")
     await call.answer("✔ подтверждено")
 
 @router.callback_query(F.data.startswith("adm_reject:"))
@@ -1639,6 +1910,7 @@ async def adm_reject_payment(call: CallbackQuery, bot: Bot):
     parts      = call.data.split(":")
     payment_id = int(parts[1])
     user_db_id = int(parts[2])
+    page       = int(parts[3]) if len(parts) > 3 else None
     with get_db() as conn:
         u = conn.execute("SELECT telegram_id FROM users WHERE id=?", (user_db_id,)).fetchone()
         conn.execute("UPDATE payments SET status='rejected' WHERE id=?", (payment_id,))
@@ -1648,10 +1920,13 @@ async def adm_reject_payment(call: CallbackQuery, bot: Bot):
             await bot.send_message(u['telegram_id'],
                 "✕ ваш платёж отклонён. обратитесь в поддержку.")
         except Exception: pass
-    try:
-        await call.message.delete()
-    except Exception:
-        await call.message.edit_text(f"✕ платёж #{payment_id} отклонён")
+    if page is not None:
+        await render_payments_menu(call.message, page)
+    else:
+        try:
+            await call.message.delete()
+        except Exception:
+            await call.message.edit_text(f"✕ платёж #{payment_id} отклонён")
     await bot.send_message(ADMIN_ID, f"✕ платёж #{payment_id} отклонён")
     await call.answer("✕ отклонено")
 
@@ -1660,41 +1935,24 @@ async def adm_reject_payment(call: CallbackQuery, bot: Bot):
 async def adm_svc_orders(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id): return
     await state.clear()
-    with get_db() as conn:
-        orders = conn.execute(
-            "SELECT so.*, p.name AS pname, u.telegram_id, u.full_name AS uname "
-            "FROM service_orders so "
-            "JOIN products p ON p.id=so.product_id "
-            "JOIN users u ON u.id=so.user_id "
-            "WHERE so.status IN ('pending','active') ORDER BY so.created_at DESC"
-        ).fetchall()
-    if not orders:
-        await call.message.edit_text(
-            "✔ нет активных заявок на услуги",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="← Назад", callback_data="admin_back")]
-            ])
-        ); return
     await call.answer()
-    for o in orders:
-        status_map = {"pending": "⏳ ожидает", "active": "⇢ в работе"}
-        answers_text = ""
-        if o['answers']:
-            try:
-                qa = json.loads(o['answers'])
-                answers_text = "\n" + "\n".join(f"  ❝{q}❞\n  → {a}" for q, a in qa.items())
-            except Exception:
-                pass
-        await call.message.answer(
-            f"♱ <b>Заявка #{o['id']}</b> — {status_map.get(o['status'], o['status'])}\n"
-            f"◦ клиент: <a href='tg://user?id={o['telegram_id']}'>{o['uname']}</a>\n"
-            f"◦ ID: <code>{o['telegram_id']}</code>\n"
-            f"◦ услуга: <b>{o['pname']}</b>\n"
-            f"◦ дата: {o['created_at'][:16]}"
-            f"{answers_text}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_service_order_admin(o['id'], o['telegram_id'], o['status'])
-        )
+    await render_svc_menu(call.message, 0)
+
+@router.callback_query(F.data.startswith("adm_svc_page:"))
+async def adm_svc_page(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await state.clear()
+    page = int(call.data.split(":")[1])
+    await call.answer()
+    await render_svc_menu(call.message, page)
+
+@router.callback_query(F.data.startswith("adm_svc_view:"))
+async def adm_svc_view(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await state.clear()
+    _, page, oid = call.data.split(":")
+    await call.answer()
+    await render_svc_view(call.message, int(oid), int(page))
 
 @router.callback_query(F.data.startswith("adm_svc_active:"))
 async def adm_svc_active(call: CallbackQuery, bot: Bot):
@@ -1721,8 +1979,11 @@ async def adm_svc_active(call: CallbackQuery, bot: Bot):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✔ Завершить услугу",
                                   callback_data=f"adm_svc_done:{order_id}")],
+            [InlineKeyboardButton(text="✕ Отменить услугу (возврат)",
+                                  callback_data=f"adm_svc_cancel:{order_id}")],
             [InlineKeyboardButton(text="☛ Написать клиенту",
-                                  url=f"tg://user?id={u['telegram_id'] if u else 0}")]
+                                  url=f"tg://user?id={u['telegram_id'] if u else 0}")],
+            [InlineKeyboardButton(text="← К заявкам", callback_data="adm_svc_orders")]
         ])
     )
     await call.answer()
@@ -1747,7 +2008,12 @@ async def adm_svc_done(call: CallbackQuery, bot: Bot):
                 f"◦ каталог снова доступен\n♡ спасибо что выбрали нас!",
                 parse_mode=ParseMode.HTML)
         except Exception: pass
-    await call.message.edit_text(f"✔ услуга #{order_id} завершена. пользователь разблокирован.")
+    await call.message.edit_text(
+        f"✔ услуга #{order_id} завершена. пользователь разблокирован.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← К заявкам", callback_data="adm_svc_orders")]
+        ])
+    )
     await call.answer()
 
 # ── Отмена услуги администратором ────────────
@@ -1788,7 +2054,10 @@ async def adm_svc_cancel(call: CallbackQuery, bot: Bot):
             pass
     await call.message.edit_text(
         f"✕ услуга #{order_id} отменена. <b>{p['price']:.2f}₽</b> возвращены пользователю.",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← К заявкам", callback_data="adm_svc_orders")]
+        ])
     )
     await call.answer()
 
@@ -1982,6 +2251,7 @@ async def adm_edit_prod(call: CallbackQuery):
     ptype     = p['type'] or 'product'
     type_text = "♱ Услуга" if ptype == 'service' else "◦ Товар"
     file_text = "◦ файл: загружен ✔" if p['prod_file'] else "◦ файл: не загружен"
+    photo_text = "◦ обложка: загружена ✔" if p['photo'] else "◦ обложка: не загружена"
     form_text = ""
     if ptype == 'service' and p['form_questions']:
         try:
@@ -1997,6 +2267,7 @@ async def adm_edit_prod(call: CallbackQuery):
         f"◦ тип: {type_text}\n"
         f"✯ {p['price']:.2f}₽\n"
         f"{repurchase_text}\n"
+        f"{photo_text}\n"
         f"{''+file_text if ptype=='product' else ''+form_text}",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_edit_product(prod_id, ptype, allow_repurchase)
@@ -2062,6 +2333,61 @@ async def adm_edit_pprice(msg: Message, state: FSMContext):
         conn.commit()
     await state.clear()
     await msg.answer(f"✔ цена обновлена: {price:.2f}₽")
+
+# ── Обложка / фото товара ──────────────────────
+@router.callback_query(F.data.startswith("adm_pphoto:"))
+async def adm_edit_pphoto_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    prod_id = int(call.data.split(":")[1])
+    with get_db() as conn:
+        p = conn.execute("SELECT * FROM products WHERE id=?", (prod_id,)).fetchone()
+    await state.update_data(edit_prod_id=prod_id)
+    await state.set_state(AdminStates.edit_prod_photo)
+    photo_status = "◦ текущая обложка: <b>загружена ✔</b>" if p['photo'] else "◦ обложка пока не загружена"
+    await call.message.edit_text(
+        f"◦ <b>Обложка товара: {p['name']}</b>\n\n"
+        f"{photo_status}\n\n"
+        f"☛ отправь фото — оно будет показано в каталоге\n"
+        f"◦ можно удалить и загрузить новое",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✕ Удалить обложку", callback_data=f"adm_pphoto_del:{prod_id}")],
+            [InlineKeyboardButton(text="← Назад",          callback_data=f"adm_edit_prod:{prod_id}")],
+        ])
+    )
+
+@router.message(AdminStates.edit_prod_photo, F.photo)
+async def adm_edit_pphoto_receive(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id): return
+    data    = await state.get_data()
+    prod_id = data['edit_prod_id']
+    file_id = msg.photo[-1].file_id
+    raw     = encode_file(file_id, "photo")
+    with get_db() as conn:
+        conn.execute("UPDATE products SET photo=? WHERE id=?", (raw, prod_id))
+        conn.commit()
+        p = conn.execute("SELECT name FROM products WHERE id=?", (prod_id,)).fetchone()
+    await state.clear()
+    await msg.answer(f"✔ обложка обновлена для <b>{p['name']}</b>", parse_mode=ParseMode.HTML)
+
+@router.message(AdminStates.edit_prod_photo)
+async def adm_edit_pphoto_wrong(msg: Message):
+    await msg.answer("◦ нужно отправить фото (из галереи)")
+
+@router.callback_query(F.data.startswith("adm_pphoto_del:"))
+async def adm_pphoto_delete(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    await state.clear()
+    prod_id = int(call.data.split(":")[1])
+    with get_db() as conn:
+        conn.execute("UPDATE products SET photo=NULL WHERE id=?", (prod_id,))
+        conn.commit()
+    await call.message.edit_text(
+        "✕ обложка удалена",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← Назад", callback_data=f"adm_edit_prod:{prod_id}")]
+        ])
+    )
 
 # ── Файл товара (admin) ───────────────────────
 @router.callback_query(F.data.startswith("adm_pfile:"))
@@ -2421,7 +2747,10 @@ async def adm_broadcast_start(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id): return
     await state.set_state(AdminStates.broadcast_text)
     await call.message.edit_text(
-        "⇢ <b>Рассылка</b>\n\n◦ введи текст (поддерживает HTML):",
+        "⇢ <b>Рассылка</b>\n\n"
+        "◦ отправь текст или фото/документ с подписью — форматирование сохранится\n"
+        "◦ инлайн-кнопки: пиши так [[Название|https://link]] (можно несколько, по 2 в ряд)\n"
+        "◦ всё сообщение уйдёт пользователям как есть",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="← Отмена", callback_data="admin_back")]
@@ -2435,9 +2764,39 @@ async def adm_broadcast(msg: Message, state: FSMContext, bot: Bot):
     with get_db() as conn:
         users = conn.execute("SELECT telegram_id FROM users").fetchall()
     sent, failed = 0, 0
+
+    # Текст/подпись + кнопки
+    text = msg.html_text or msg.html_caption or ""
+    clean_text, buttons = extract_inline_buttons(text)
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+    async def _send_to_user(tg_id: int):
+        if msg.photo:
+            await bot.send_photo(tg_id, msg.photo[-1].file_id,
+                                 caption=clean_text or None,
+                                 parse_mode=ParseMode.HTML if clean_text else None,
+                                 reply_markup=markup)
+        elif msg.document:
+            await bot.send_document(tg_id, msg.document.file_id,
+                                    caption=clean_text or None,
+                                    parse_mode=ParseMode.HTML if clean_text else None,
+                                    reply_markup=markup)
+        elif msg.video:
+            await bot.send_video(tg_id, msg.video.file_id,
+                                 caption=clean_text or None,
+                                 parse_mode=ParseMode.HTML if clean_text else None,
+                                 reply_markup=markup)
+        elif msg.animation:
+            await bot.send_animation(tg_id, msg.animation.file_id,
+                                     caption=clean_text or None,
+                                     parse_mode=ParseMode.HTML if clean_text else None,
+                                     reply_markup=markup)
+        else:
+            await bot.send_message(tg_id, clean_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
     for u in users:
         try:
-            await bot.send_message(u['telegram_id'], msg.text, parse_mode=ParseMode.HTML)
+            await _send_to_user(u['telegram_id'])
             sent += 1
         except Exception:
             failed += 1
