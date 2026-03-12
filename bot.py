@@ -1388,13 +1388,13 @@ async def buy_product(call: CallbackQuery, state: FSMContext):
     await state.set_state(ConfirmStates.confirm_buy)
     type_word  = "услуги" if ptype == 'service' else "товара"
     action_btn = "✔ Заказать услугу" if ptype == 'service' else "✔ Подтвердить покупку"
-    await call.message.edit_text(
+    await safe_edit(
+        call.message,
         f"◦ <b>Подтверждение {type_word}</b>\n{'─'*22}\n"
         f"{'♱' if ptype=='service' else '◈'} <b>{p['name']}</b>\n\n"
         f"✯ Цена: <b>{p['price']:.2f}₽</b>\n"
         f"◦ Баланс после: <b>{user['balance'] - p['price']:.2f}₽</b>\n\n"
         f"☛ подтвердите покупку",
-        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=action_btn,   callback_data=f"buy_confirm:{product_id}")],
             [InlineKeyboardButton(text="✕ Отмена",   callback_data=f"product:{product_id}")],
